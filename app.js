@@ -1,17 +1,35 @@
 const express = require('express');
+const http = require('http');
 const cors = require('cors');
+const { Server } = require('socket.io');
 const config = require('./config/config');
 const paymentRoutes = require('./routes/payment');
 const webhookRoutes = require('./routes/webhook');
 const database = require('./models/Database');
+const socketService = require('./models/SocketService');
 
 const app = express();
+const server = http.createServer(app);
+
+// Initialize Socket.IO
+const io = new Server(server, {
+  cors: {
+    origin: process.env.NODE_ENV === 'production' 
+      ? ['https://yourdomain.com'] 
+      : ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:5173'],
+    credentials: true,
+    methods: ['GET', 'POST']
+  }
+});
+
+// Initialize Socket Service
+socketService.initialize(io);
 
 // CORS configuration
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
     ? ['https://yourdomain.com'] 
-    : ['http://localhost:3000', 'http://localhost:3001'],
+    : ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:5173'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-razorpay-signature']
@@ -168,6 +186,61 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
+// Donation goal endpoint
+app.get('/api/donation-goal', async (req, res) => {
+  try {
+    const goal = parseInt(process.env.DONATION_GOAL || '10000');
+    const stats = await socketService.getStats();
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        goal: goal,
+        current: stats.total_amount || 0,
+        percentage: Math.min(100, ((stats.total_amount || 0) / goal) * 100),
+        donations_count: stats.total_donations || 0,
+        remaining: Math.max(0, goal - (stats.total_amount || 0))
+      }
+    });
+  } catch (error) {
+    console.error('Donation goal error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to get donation goal'
+    });
+  }
+});
+
+// Recent donations endpoint
+app.get('/api/recent-donations', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit || '5');
+    const donations = await socketService.getRecentDonations(limit);
+    
+    res.status(200).json({
+      success: true,
+      data: donations
+    });
+  } catch (error) {
+    console.error('Recent donations error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to get recent donations'
+    });
+  }
+});
+
+// Socket.IO status endpoint
+app.get('/api/socket-status', (req, res) => {
+  res.status(200).json({
+    success: true,
+    data: {
+      connected_clients: socketService.getConnectedClientsCount(),
+      timestamp: new Date().toISOString()
+    }
+  });
+});
+
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
@@ -202,10 +275,11 @@ process.on('SIGINT', () => {
 
 // Start server
 if (require.main === module) {
-  app.listen(config.port, () => {
+  server.listen(config.port, () => {
     console.log(`🚀 Payment Alert API server running on port ${config.port}`);
     console.log(`📊 Health check: http://localhost:${config.port}/health`);
     console.log(`🌍 Environment: ${config.nodeEnv}`);
+    console.log(`🔌 Socket.IO enabled for real-time alerts`);
     
     if (config.nodeEnv === 'development') {
       console.log('\n📋 Available endpoints:');
@@ -220,6 +294,9 @@ if (require.main === module) {
       console.log(`   GET  /api/overlay-config`);
       console.log(`   GET  /api/payments/status/:order_id`);
       console.log(`   GET  /api/stats`);
+      console.log(`   GET  /api/donation-goal`);
+      console.log(`   GET  /api/recent-donations`);
+      console.log(`   GET  /api/socket-status`);
     }
   });
 }

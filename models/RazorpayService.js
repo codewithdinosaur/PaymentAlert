@@ -3,6 +3,7 @@ const QRCode = require('qrcode');
 const crypto = require('crypto');
 const config = require('../config/config');
 const database = require('./Database');
+const socketService = require('./SocketService');
 
 class RazorpayService {
   constructor() {
@@ -306,6 +307,13 @@ class RazorpayService {
       amount: payment.amount / 100,
       method: payment.method
     });
+    
+    // Emit donation to connected overlays
+    await socketService.emitDonation({
+      razorpay_payment_id: payment.id,
+      order_id: payment.order_id,
+      method: payment.method
+    });
   }
 
   async handlePaymentFailed(payment) {
@@ -323,6 +331,15 @@ class RazorpayService {
   async handleOrderPaid(order) {
     console.log('Order paid:', order.id);
     await database.updateOrderStatus(order.id, 'paid');
+    
+    // Emit donation to connected overlays if payment info is available
+    if (order.payment_id) {
+      await socketService.emitDonation({
+        razorpay_payment_id: order.payment_id,
+        order_id: order.id,
+        method: order.method || 'unknown'
+      });
+    }
   }
 
   async handleUPIMandateAuthorized(mandate) {
