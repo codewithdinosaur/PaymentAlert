@@ -234,12 +234,22 @@ router.post('/verify-payment', async (req, res) => {
 
     // Update payment status in database
     const database = require('../models/Database');
+    const orderRecord = await database.getOrderByRazorpayId(order_id);
+
+    if (!orderRecord) {
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found for verification'
+      });
+    }
+
     await database.updateOrderStatus(order_id, 'verified');
     await database.createPayment({
+      order_id: orderRecord.id,
       razorpay_payment_id: payment_id,
       razorpay_order_id: order_id,
       status: 'verified',
-      amount: 0, // Will be updated from Razorpay if needed
+      amount: orderRecord.amount,
       method: 'upi'
     });
 

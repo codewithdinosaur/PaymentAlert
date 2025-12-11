@@ -3,6 +3,8 @@ const QRCode = require('qrcode');
 const crypto = require('crypto');
 const config = require('../config/config');
 const database = require('./Database');
+const { verifySignature } = require('../utils/signature');
+const { evaluateFraudIndicators } = require('../utils/fraudDetection');
 
 class RazorpayService {
   constructor() {
@@ -10,6 +12,7 @@ class RazorpayService {
       key_id: config.razorpay.keyId,
       key_secret: config.razorpay.keySecret,
     });
+    this.fraudConfig = config.fraud;
   }
 
   // Create a new order for donation
@@ -232,35 +235,38 @@ class RazorpayService {
   // Process webhook events
   async processWebhook(body, signature) {
     try {
-      // Verify webhook signature
       if (!this.verifyWebhookSignature(body, signature)) {
         throw new Error('Invalid webhook signature');
       }
 
       const event = JSON.parse(body);
-      console.log('Received webhook event:', event.event);
+      const eventType = event.event;
+      console.log('[Webhook] Received event:', eventType);
 
-      switch (event.event) {
+      let result = { handled: false };
+
+      switch (eventType) {
         case 'payment.captured':
-          await this.handlePaymentCaptured(event.payload.payment);
+          result = await this.handlePaymentCaptured(event.payload.payment);
           break;
         case 'payment.failed':
-          await this.handlePaymentFailed(event.payload.payment);
+          result = await this.handlePaymentFailed(event.payload.payment);
           break;
         case 'order.paid':
-          await this.handleOrderPaid(event.payload.order);
+          result = await this.handleOrderPaid(event.payload.order);
           break;
         case 'upi.autopay.authorized':
-          await this.handleUPIMandateAuthorized(event.payload.mandate);
+          result = await this.handleUPIMandateAuthorized(event.payload.mandate);
           break;
         case 'upi.autopay.cancelled':
-          await this.handleUPIMandateCancelled(event.payload.mandate);
+          result = await this.handleUPIMandateCancelled(event.payload.mandate);
           break;
         default:
-          console.log('Unhandled webhook event:', event.event);
+          console.log('[Webhook] Unhandled event:', eventType);
+          result = { handled: false, message: `Unhandled event: ${eventType}` };
       }
 
-      return { success: true, message: 'Webhook processed successfully' };
+      return { success: true, event: eventType, result };
     } catch (error) {
       console.error('Error processing webhook:', error);
       throw new Error(`Webhook processing failed: ${error.message}`);
@@ -288,36 +294,73 @@ class RazorpayService {
   }
 
   verifyWebhookSignature(body, signature) {
-    const expectedSignature = crypto
-      .createHmac('sha256', config.razorpay.webhookSecret)
-      .update(body)
-      .digest('hex');
-
-    return expectedSignature === signature;
+    return verifySignature(body, signature, config.razorpay.webhookSecret);
   }
 
-  async handlePaymentCaptured(payment) {
-    console.log('Payment captured:', payment.id);
-    await database.updateOrderStatus(payment.order_id, 'paid', payment.method);
-    await database.createPayment({
-      razorpay_payment_id: payment.id,
-      razorpay_order_id: payment.order_id,
-      status: 'captured',
-      amount: payment.amount / 100,
-      method: payment.method
-    });
+  async handlePaymentCaptured(paymentPayload) {
+    const payment = this.extractPaymentEntity(paymentPayload);
+
+    if (!payment) {
+      throw new Error('Missing payment payload');
+    }
+
+    if (payment.status && payment.status !== 'captured') {
+      console.warn('[Webhook] Ignoring payment with non-captured status:', payment.status);
+      return { handled: false, reason: 'non_captured_status' };
+    }
+
+    const paymentAmount = this.normalizePaymentAmount(payment);
+    const order = payment.order_id ? await database.getOrderByRazorpayId(payment.order_id) : null;
+
+    const fraudEvaluation = await this.evaluatePaymentForFraud(order, payment, paymentAmount);
+    const paymentStatus = fraudEvaluation.flagged ? 'flagged' : 'captured';
+
+    let paymentRecord = fraudEvaluation.existingPayment;
+    if (!fraudEvaluation.duplicatePaymentDetected) {
+      paymentRecord = await this.persistPaymentRecord(order, payment, paymentAmount, paymentStatus);
+      if (payment.order_id) {
+        const nextStatus = fraudEvaluation.flagged ? 'under_review' : 'paid';
+        await database.updateOrderStatus(payment.order_id, nextStatus, payment.method);
+      }
+    } else {
+      console.warn('[Webhook] Duplicate payment ID detected, skipping persistence for', payment.id);
+    }
+
+    return {
+      handled: true,
+      flagged: fraudEvaluation.flagged,
+      reasons: fraudEvaluation.reasons,
+      metadata: fraudEvaluation.metadata,
+      payment_id: payment.id,
+      order_id: payment.order_id,
+      status: paymentStatus,
+      duplicatePayment: fraudEvaluation.duplicatePaymentDetected,
+      paymentRecord,
+    };
   }
 
-  async handlePaymentFailed(payment) {
-    console.log('Payment failed:', payment.id);
-    await database.updateOrderStatus(payment.order_id, 'failed', payment.method);
-    await database.createPayment({
-      razorpay_payment_id: payment.id,
-      razorpay_order_id: payment.order_id,
+  async handlePaymentFailed(paymentPayload) {
+    const payment = this.extractPaymentEntity(paymentPayload);
+
+    if (!payment) {
+      throw new Error('Missing payment payload');
+    }
+
+    const amount = this.normalizePaymentAmount(payment);
+    const order = payment.order_id ? await database.getOrderByRazorpayId(payment.order_id) : null;
+
+    await this.persistPaymentRecord(order, payment, amount, 'failed');
+
+    if (payment.order_id) {
+      await database.updateOrderStatus(payment.order_id, 'failed', payment.method);
+    }
+
+    return {
+      handled: true,
+      payment_id: payment.id,
+      order_id: payment.order_id,
       status: 'failed',
-      amount: payment.amount / 100,
-      method: payment.method
-    });
+    };
   }
 
   async handleOrderPaid(order) {
@@ -333,6 +376,100 @@ class RazorpayService {
   async handleUPIMandateCancelled(mandate) {
     console.log('UPI mandate cancelled:', mandate.id);
     await database.updateMandateStatus(mandate.id, 'cancelled');
+  }
+
+  extractPaymentEntity(payload) {
+    if (!payload) {
+      return null;
+    }
+
+    return payload.entity || payload;
+  }
+
+  normalizePaymentAmount(payment) {
+    if (!payment || typeof payment.amount !== 'number') {
+      return 0;
+    }
+
+    return Number((payment.amount / 100).toFixed(2));
+  }
+
+  async evaluatePaymentForFraud(order, payment, paymentAmount) {
+    const rapidFireWindow = this.fraudConfig?.rapidFire?.windowMinutes || 2;
+    const normalizedOrderAmount = order && order.amount !== undefined ? Number(order.amount) : null;
+    const orderAmount = Number.isFinite(normalizedOrderAmount) ? normalizedOrderAmount : null;
+
+    const existingPayment = payment.id
+      ? await database.getPaymentByRazorpayPaymentId(payment.id)
+      : null;
+
+    const duplicateOrderPaymentCount = payment.order_id
+      ? await database.countCapturedPaymentsByOrderId(payment.order_id)
+      : 0;
+
+    const contactRapidFireCount = order?.contact
+      ? await database.countCapturedPaymentsByContactWithinWindow(order.contact, rapidFireWindow)
+      : 0;
+
+    const emailRapidFireCount = order?.email
+      ? await database.countCapturedPaymentsByEmailWithinWindow(order.email, rapidFireWindow)
+      : 0;
+
+    const rapidFireBaseline = Math.max(contactRapidFireCount, emailRapidFireCount) + 1;
+    const amountDifference = orderAmount !== null ? Math.abs(orderAmount - paymentAmount) : 0;
+
+    const indicators = {
+      hasDuplicatePaymentId: Boolean(existingPayment),
+      duplicateOrderPaymentCount,
+      amountDifference,
+      rapidFireCount: rapidFireBaseline,
+    };
+
+    const evaluation = evaluateFraudIndicators(indicators, this.fraudConfig);
+
+    if (evaluation.isFlagged) {
+      await database.createOrUpdateFraudLog({
+        razorpay_payment_id: payment.id,
+        razorpay_order_id: payment.order_id,
+        order_amount: orderAmount,
+        paid_amount: paymentAmount,
+        contact: order?.contact || null,
+        email: order?.email || null,
+        status: 'flagged',
+        reasons: JSON.stringify(evaluation.reasons),
+        metadata: JSON.stringify({
+          ...evaluation.metadata,
+          duplicateOrderPaymentCount,
+          contactRapidFireCount,
+          emailRapidFireCount,
+        }),
+      });
+    }
+
+    return {
+      flagged: evaluation.isFlagged,
+      reasons: evaluation.reasons,
+      metadata: {
+        ...evaluation.metadata,
+        duplicateOrderPaymentCount,
+        contactRapidFireCount,
+        emailRapidFireCount,
+      },
+      duplicatePaymentDetected: Boolean(existingPayment),
+      existingPayment,
+    };
+  }
+
+  async persistPaymentRecord(order, payment, amount, status) {
+    return database.createPayment({
+      order_id: order ? order.id : null,
+      razorpay_payment_id: payment.id,
+      razorpay_order_id: payment.order_id,
+      razorpay_signature: payment.signature || null,
+      status,
+      amount,
+      method: payment.method,
+    });
   }
 
   // Update order in database

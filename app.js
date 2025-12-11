@@ -3,9 +3,20 @@ const cors = require('cors');
 const config = require('./config/config');
 const paymentRoutes = require('./routes/payment');
 const webhookRoutes = require('./routes/webhook');
+const fraudRoutes = require('./routes/fraud');
 const database = require('./models/Database');
 
 const app = express();
+
+const captureRawWebhookBody = (req, res, buf) => {
+  if (!buf || !req.originalUrl) {
+    return;
+  }
+
+  if (req.originalUrl.startsWith('/api/webhooks')) {
+    req.rawBody = buf.toString('utf8');
+  }
+};
 
 // CORS configuration
 app.use(cors({
@@ -18,8 +29,8 @@ app.use(cors({
 }));
 
 // Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '10mb', verify: captureRawWebhookBody }));
+app.use(express.urlencoded({ extended: true, limit: '10mb', verify: captureRawWebhookBody }));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -35,6 +46,7 @@ app.get('/health', (req, res) => {
 // API routes
 app.use('/api/payments', paymentRoutes);
 app.use('/api/webhooks', webhookRoutes);
+app.use('/api/fraud', fraudRoutes);
 
 // Payment overlay configuration endpoint
 app.get('/api/overlay-config', (req, res) => {
@@ -220,6 +232,9 @@ if (require.main === module) {
       console.log(`   GET  /api/overlay-config`);
       console.log(`   GET  /api/payments/status/:order_id`);
       console.log(`   GET  /api/stats`);
+      console.log(`   GET  /api/fraud/logs`);
+      console.log(`   POST /api/fraud/logs/:log_id/approve`);
+      console.log(`   POST /api/fraud/logs/:log_id/reject`);
     }
   });
 }
