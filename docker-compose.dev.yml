@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # MongoDB database for development
+  mongodb:
+    image: mongo:7.0
+    container_name: payment-alert-mongodb-dev
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password123
+      MONGO_INITDB_DATABASE: payment_alert_dev
+    volumes:
+      - mongodb_dev_data:/data/db
+    networks:
+      - payment-alert-dev-network
+
+volumes:
+  mongodb_dev_data:
+    driver: local
+
+networks:
+  payment-alert-dev-network:
+    driver: bridge
