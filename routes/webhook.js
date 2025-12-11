@@ -11,10 +11,10 @@ const crypto = require('crypto');
 router.post('/razorpay', async (req, res) => {
   try {
     const signature = req.headers['x-razorpay-signature'];
-    const body = JSON.stringify(req.body);
+    const rawBody = req.rawBody || JSON.stringify(req.body);
 
     console.log('Received webhook:', {
-      event: req.body.event,
+      event: req.body?.event,
       signature: signature ? 'present' : 'missing'
     });
 
@@ -26,7 +26,11 @@ router.post('/razorpay', async (req, res) => {
     }
 
     // Process the webhook
-    const result = await RazorpayService.processWebhook(body, signature);
+    const result = await RazorpayService.processWebhook(rawBody, signature);
+    console.log('Webhook handled successfully:', {
+      event: result?.event,
+      flagged: result?.result?.flagged,
+    });
     
     res.status(200).json({
       success: true,
